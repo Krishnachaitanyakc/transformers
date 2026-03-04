@@ -168,6 +168,7 @@ class ContinuousBatchProcessor:
         self.scheduler.reset()
         self.inputs_and_outputs.reset()
         self.cache.free_all_requests()
+        self.metrics = ContinuousBatchProcessorMetrics(self.cache.max_batch_tokens)
 
     @traced
     def _get_new_requests(self) -> None:
@@ -884,7 +885,7 @@ class ContinuousMixin:
         # If a persistent manager is found we return it
         cached_manager = getattr(self, "_cached_continuous_batching_manager", None)
         if isinstance(cached_manager, ContinuousBatchingManager):
-            logging.info(
+            logger.info(
                 "Cached continuous batching manager found: it will be re-used instead of creating a new one. If you"
                 " want to create a new manager, you should call `destroy_cached_continuous_batching_manager` first."
             )
