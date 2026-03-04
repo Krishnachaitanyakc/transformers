@@ -163,6 +163,12 @@ class ContinuousBatchProcessor:
             + self.inputs_and_outputs.get_model_kwargs().__repr__()
         )
 
+    def reset(self) -> None:
+        """Reset the batch processor for a new generation loop."""
+        self.scheduler.reset()
+        self.inputs_and_outputs.reset()
+        self.cache.free_all_requests()
+
     @traced
     def _get_new_requests(self) -> None:
         """Pull new requests from the input queue and add to waiting list."""
@@ -565,7 +571,7 @@ class ContinuousBatchingManager:
         if self._generation_thread is not None and self._generation_thread.is_alive():
             logger.warning("Manager thread is already running.")
             return
-
+        self.stop_event.clear()
         self._generation_thread = threading.Thread(target=self._run_generation_loop)
         self._generation_thread.start()
 
@@ -574,12 +580,13 @@ class ContinuousBatchingManager:
         return self._generation_thread is not None and self._generation_thread.is_alive()
 
     # NOTE: don't forget to update `continuous_batching_context_manager` when changing this method's definition
-    def stop(self, block: bool = True, timeout: float | None = None) -> None:
+    def stop(self, block: bool = True, timeout: float | None = None, keep_for_next_session: bool = False) -> None:
         """Signal the background thread to stop.
 
         Args:
             block: Whether to wait for the thread to stop
             timeout: Maximum time to wait for the thread to stop
+            keep_for_next_session: Whether to cache this on the model for future use
         """
         if self.batch_processor is None:
             logger.warning("\nBatch processor was not initialized.")
@@ -589,7 +596,8 @@ class ContinuousBatchingManager:
             )
 
         if self._generation_thread is None:
-            logger.warning("Manager not started.")
+            suffix = " Hence the unstarted manager will not be kept for next session." if keep_for_next_session else ""
+            logger.warning("Manager not started." + suffix)
             return
 
         stop_trigger_time = perf_counter()
@@ -600,7 +608,13 @@ class ContinuousBatchingManager:
         if block:
             self.join(stop_trigger_time, timeout)
 
-        self.batch_processor = None
+        # If the manager is not being kept for next session, we clear the batch processor
+        if not keep_for_next_session:
+            self.batch_processor = None
+        # Otherwise, we keep the batch processor and cache the manager as a model attribute
+        else:
+            logger.info("Continuous batching manager will be kept for next session.")
+            self.model._cached_continuous_batching_manager = self
 
     def join(self, stop_trigger_time: float, timeout: float | None = None) -> None:
         """Wait for the background thread to finish.
@@ -871,6 +885,15 @@ class ContinuousMixin:
         if not hasattr(self, "config") or not hasattr(self, "device") or not hasattr(self, "dtype"):
             raise AttributeError("Model must have 'config', 'device', and 'dtype' attributes.")
 
+        # If a persistent manager is found we return it
+        cached_manager = getattr(self, "_cached_continuous_batching_manager", None)
+        if isinstance(cached_manager, ContinuousBatchingManager):
+            logging.info(
+                "Cached continuous batching manager found: it will be re-used instead of creating a new one. If you"
+                " want to create a new manager, you should call `destroy_cached_continuous_batching_manager` first."
+            )
+            return cached_manager
+
         # Retrieve generation config
         gen_config = generation_config if generation_config is not None else self.generation_config
         if gen_config is None:
@@ -894,6 +917,13 @@ class ContinuousMixin:
             model=self, generation_config=gen_config, continuous_batching_config=cb_config
         )
 
+    def destroy_cached_continuous_batching_manager(self) -> None:
+        """Destroy the cached continuous batching manager and free GPU resources."""
+        cached_manager = getattr(self, "_cached_continuous_batching_manager", None)
+        if isinstance(cached_manager, ContinuousBatchingManager):
+            cached_manager.stop(block=True, timeout=None, keep_for_next_session=False)
+            delattr(self, "_cached_continuous_batching_manager")
+
     @contextmanager
     def continuous_batching_context_manager(
         self,
@@ -901,12 +931,14 @@ class ContinuousMixin:
         block: bool = True,
         timeout: float | None = None,
         continuous_batching_config: ContinuousBatchingConfig | None = None,
+        persistent_manager: bool = False,
         **deprecated_kwargs,
     ) -> Generator[ContinuousBatchingManager]:
         """A context manager to safely use the continuous batching manager. Arguments are similars to the ones of
         `init_continuous_batching`, expect for:
             - block: whether to block the thread when stopping the manager. Default is True.
             - timeout: maximum time to wait for the thread to stop. Default is None (no timeout).
+            - persistent_manager: whether to persist the manager after the context manager is exited. Default is False.
         """
         manager = self.init_continuous_batching(
             generation_config=generation_config,
@@ -919,7 +951,7 @@ class ContinuousMixin:
         finally:
             # This is a dummy log needed for the logs of stop to show. It won't show.
             logger.debug("Continuous batching loop finished")
-            manager.stop(block=block, timeout=timeout)
+            manager.stop(block=block, timeout=timeout, keep_for_next_session=persistent_manager)
 
     # TODO: support streaming
     @traced
@@ -931,6 +963,7 @@ class ContinuousMixin:
         continuous_batching_config: ContinuousBatchingConfig | None = None,
         record_timestamps: bool = False,
         progress_bar: bool = True,
+        persistent_manager: bool = False,
         **kwargs,
     ) -> dict[str, GenerationOutput]:
         """Generate sequences for a batch of prompts using continuous batching.
@@ -941,9 +974,9 @@ class ContinuousMixin:
             continuous_batching_config: Optional continuous batching configuration
             record_timestamps: If set to true, the requests will have a timestamp for each token generated
             progress_bar: If set to true, a progress bar will be displayed
+            persistent_manager: whether to persist the manager after the generation is finished. Default is False.
             **kwargs: Additional generation parameters. Only max_new_tokens is used, but other deprecated arguments
                 are extracted and passed to the continuous_batching_config object.
-
         Returns:
             `dict[str, GenerationOutput]`: a dictionary of request ids to GenerationOutput objects
         """
@@ -984,6 +1017,7 @@ class ContinuousMixin:
             continuous_batching_config=continuous_batching_config,
             block=True,
             timeout=5,
+            persistent_manager=persistent_manager,
             **deprecated_kwargs,
         )
         logging_cm = logging_redirect_tqdm([logger])
