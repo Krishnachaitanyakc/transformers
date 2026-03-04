@@ -733,55 +733,63 @@ class ContinuousBatchingManager:
             raise RuntimeError("Tried to perform a generation step before the batch processor was initialized.")
         self.batch_processor._generation_step(self.model, self.logit_processor, self.do_sample)
 
+    def _create_batch_processor(self) -> ContinuousBatchProcessor:
+        # Create the PagedAttentionCache
+        paged_attention_cache = PagedAttentionCache(
+            self.model.config,
+            self.generation_config,
+            self.model.device,
+            self.model.dtype,
+            tp_size=getattr(self.model, "_tp_size", None),  # Use model's actual TP setting
+            allow_block_sharing=self._allow_block_sharing,
+        )
+        self._use_prefix_sharing = paged_attention_cache.use_prefix_sharing  # update the approximation
+
+        # Create the scheduler
+        scheduler = None
+        if hasattr(self.generation_config, "scheduler"): # BUG
+            scheduler = SCHEDULER_MAPPING.get(self.generation_config.scheduler, None)
+            if scheduler is None:
+                logger.warning(f"Scheduler '{scheduler}' not found. Defaulting to FIFO.")
+                scheduler = FIFOScheduler
+        else:
+            # Default to fifo
+            scheduler = FIFOScheduler
+
+        # Create the batch processor
+        batch_processor = ContinuousBatchProcessor(
+            cache=paged_attention_cache,
+            config=self.model.config,
+            generation_config=self.generation_config,
+            input_queue=self.input_queue,
+            output_queue=self.output_queue,
+            stop_event=self.stop_event,
+            model_device=self.model.device,
+            model_dtype=self.model.dtype,
+            scheduler=scheduler(paged_attention_cache),
+            use_cuda_graph=self.use_cuda_graph,
+            q_padding_interval_size=self.q_padding_interval_size,
+            kv_padding_interval_size=self.kv_padding_interval_size,
+            max_cached_graphs=self.max_cached_graphs,
+            use_async_batching=self.use_async_batching,
+        )
+        return batch_processor
+
     def _run_generation_loop(self) -> None:
         """Main processing loop running in the background thread."""
-        batch_processor: ContinuousBatchProcessor | None = None
         try:
-            t0 = perf_counter()
-            paged_attention_cache = PagedAttentionCache(
-                self.model.config,
-                self.generation_config,
-                self.model.device,
-                self.model.dtype,
-                tp_size=getattr(self.model, "_tp_size", None),  # Use model's actual TP setting
-                allow_block_sharing=self._allow_block_sharing,
-            )
-            self._use_prefix_sharing = paged_attention_cache.use_prefix_sharing  # update the approximation
-            logger.debug(f"PagedAttentionCache created in {perf_counter() - t0} seconds")
-
-            scheduler = None
-            if hasattr(self.generation_config, "scheduler"):
-                scheduler = SCHEDULER_MAPPING.get(self.generation_config.scheduler, None)
-                if scheduler is None:
-                    logger.warning(f"Scheduler '{scheduler}' not found. Defaulting to FIFO.")
-                    scheduler = FIFOScheduler
+            batch_processor = getattr(self, "batch_processor", None)
+            # If the batch processor already exists, we just reset it for a new generation loop
+            if isinstance(batch_processor, ContinuousBatchProcessor):
+                batch_processor.reset()
+            # Otherwise, we create a new batch processor
             else:
-                # Default to fifo
-                scheduler = FIFOScheduler
-
-            t1 = perf_counter()
-            batch_processor = ContinuousBatchProcessor(
-                cache=paged_attention_cache,
-                config=self.model.config,
-                generation_config=self.generation_config,
-                input_queue=self.input_queue,
-                output_queue=self.output_queue,
-                stop_event=self.stop_event,
-                model_device=self.model.device,
-                model_dtype=self.model.dtype,
-                scheduler=scheduler(paged_attention_cache),
-                use_cuda_graph=self.use_cuda_graph,
-                q_padding_interval_size=self.q_padding_interval_size,
-                kv_padding_interval_size=self.kv_padding_interval_size,
-                max_cached_graphs=self.max_cached_graphs,
-                use_async_batching=self.use_async_batching,
-            )
+                batch_processor = self._create_batch_processor()
             self.batch_processor = batch_processor
             self.current_batch = 0
-            logger.debug(f"batch_processor created in {perf_counter() - t1} seconds")
 
             # If using the async API, we bootstrap the first batch w/out update
-            if self.batch_processor.use_async_batching:
+            if batch_processor.use_async_batching:
                 if not batch_processor.prepare_next_batch():
                     raise RuntimeError("Failed to bootstrap the first batch.")
                 self._generation_step()
