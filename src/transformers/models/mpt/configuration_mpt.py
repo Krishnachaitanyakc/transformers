@@ -55,7 +55,7 @@ class MptAttentionConfig(PreTrainedConfig):
     base_config_key = "attn_config"
 
     attn_type: Literal["multihead_attention", "multiquery_attention"] = "multihead_attention"
-    attn_pdrop: int = 0
+    attn_pdrop: float | int = 0
     attn_impl: str = "torch"
     clip_qkv: float | None = None
     softmax_scale: float | None = None

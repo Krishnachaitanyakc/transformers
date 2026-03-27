@@ -60,7 +60,7 @@ class TimesformerConfig(PreTrainedConfig):
     layer_norm_eps: float = 1e-6
     qkv_bias: bool = True
     attention_type: str = "divided_space_time"
-    drop_path_rate: int = 0
+    drop_path_rate: float | int = 0
 
 
 __all__ = ["TimesformerConfig"]

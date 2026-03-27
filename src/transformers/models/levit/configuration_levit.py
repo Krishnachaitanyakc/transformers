@@ -59,7 +59,7 @@ class LevitConfig(PreTrainedConfig):
     num_attention_heads: list[int] | tuple[int, ...] = (4, 8, 12)
     depths: list[int] | tuple[int, ...] = (4, 4, 4)
     key_dim: list[int] | tuple[int, ...] = (16, 16, 16)
-    drop_path_rate: int = 0
+    drop_path_rate: float | int = 0
     mlp_ratio: list[int] | tuple[int, ...] = (2, 2, 2)
     attention_ratio: list[int] | tuple[int, ...] = (2, 2, 2)
     initializer_range: float = 0.02
